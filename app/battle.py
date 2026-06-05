@@ -13,6 +13,14 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
 from treys import Card, Evaluator
 
+from app.mistakes import (
+    BattleMistakeCandidate,
+    BattleMistakeCreate,
+    BattleMistakeScenario,
+    BattleMistakeTableSeat,
+    record_battle_mistake,
+)
+
 
 BattleStreet = Literal["preflop", "flop", "turn", "river", "showdown", "complete"]
 BattleActionType = Literal["blind", "fold", "check", "call", "bet", "raise", "all_in"]
@@ -1232,7 +1240,9 @@ def apply_player_battle_action(
     if not player.is_human:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Waiting for an agent action")
 
+    recommended = recommended_player_decision(session, player)
     decision = build_player_decision(session, player, payload.action, payload.target_total_bb)
+    record_player_action_mistake(session, player, decision, recommended, owner_id or session.owner_id)
     apply_decision(session, player, decision)
 
     if count_contenders(session) <= 1:
@@ -1280,6 +1290,166 @@ def build_player_decision(
     pot_odds = call_needed / (session.pot_bb + call_needed) if call_needed > 0 else 0
     note = f"玩家选择 {action_label(normalized_action)}。"
     return BrainDecision(normalized_action, target, equity, pot_odds, note, None)
+
+
+def recommended_player_decision(session: BattleSession, player: PlayerState) -> BrainDecision:
+    rng_state = session.rng.getstate()
+    try:
+        return decide_action(session, player)
+    finally:
+        session.rng.setstate(rng_state)
+
+
+def record_player_action_mistake(
+    session: BattleSession,
+    player: PlayerState,
+    player_decision: BrainDecision,
+    recommended: BrainDecision,
+    owner_id: str | None,
+) -> None:
+    if not owner_id or not recommended.trace:
+        return
+    if not should_record_player_mistake(player_decision, recommended):
+        return
+
+    trace = recommended.trace
+    recommended_candidate = chosen_candidate(trace.candidates) or max(trace.candidates, key=lambda item: item.ev_bb, default=None)
+    user_candidate = closest_candidate_for_action(trace.candidates, player_decision.action, player_decision.target_total_bb)
+    ev_delta = mistake_ev_delta(player_decision, recommended, user_candidate, recommended_candidate)
+    hand_class = hand_notation(player.hole_cards)
+    user_reason = f" {user_candidate.reason}" if user_candidate else ""
+    recommended_sizing = (
+        f"到 {round_bb(recommended.target_total_bb)}BB"
+        if recommended.action in {"bet", "raise", "all_in"}
+        else ""
+    )
+
+    record_battle_mistake(
+        BattleMistakeCreate(
+            owner_id=owner_id,
+            session_id=session.id,
+            hand_number=session.hand_number,
+            title=f"{player.position} {hand_class}：{action_label(player_decision.action)}偏离推荐",
+            subtitle=f"{street_label(session.street)} · 底池 {round_bb(session.pot_bb)}BB · 推荐{action_label(recommended.action)}",
+            street=session.street,
+            position=player.position,
+            hero_cards=list(player.hole_cards),
+            board=list(session.board),
+            user_action=player_decision.action,
+            user_action_label=action_label(player_decision.action),
+            user_total_bb=round_bb(player_decision.target_total_bb),
+            recommended_action=recommended.action,
+            recommended_action_label=action_label(recommended.action),
+            recommended_total_bb=round_bb(recommended.target_total_bb),
+            ev_delta_bb=ev_delta,
+            scenario=BattleMistakeScenario(
+                session_id=session.id,
+                hand_number=session.hand_number,
+                table_size=session.table_size,
+                street=session.street,
+                position=player.position,
+                hero_name=player.agent.name,
+                hero_cards=list(player.hole_cards),
+                board=list(session.board),
+                pot_bb=round_bb(session.pot_bb),
+                current_bet_bb=round_bb(session.current_bet_bb),
+                stack_bb=round_bb(player.stack_bb),
+                committed_bb=round_bb(player.total_committed_bb),
+                spr=round_bb(trace.spr),
+                table_seats=[
+                    BattleMistakeTableSeat(
+                        seat_index=seat.index,
+                        position=seat.position,
+                        name=seat.agent.name,
+                        stack_bb=round_bb(seat.stack_bb),
+                        committed_bb=round_bb(seat.total_committed_bb),
+                        status=seat.status,
+                        is_hero=seat.index == player.index,
+                    )
+                    for seat in session.players
+                ],
+                tags=trace.tags,
+            ),
+            candidates=[
+                BattleMistakeCandidate(
+                    action=candidate.action,
+                    label=action_label(candidate.action),
+                    target_total_bb=round_bb(candidate.target_total_bb),
+                    ev_bb=round_bb(candidate.ev_bb),
+                    weight=round(candidate.weight, 3),
+                    is_recommended=candidate.is_chosen,
+                    reason=candidate.reason,
+                )
+                for candidate in trace.candidates
+            ],
+            why_wrong=(
+                f"推荐引擎给出的主线是「{trace.summary}」。"
+                f"你的{action_label(player_decision.action)}相对推荐少约 {ev_delta:.1f}BB EV。{user_reason}"
+            ),
+            correct_play=(
+                f"这类 {trace.range_bucket} spot 优先{action_label(recommended.action)}{recommended_sizing}。"
+                f"{recommended_candidate.reason if recommended_candidate else recommended.note}"
+            ),
+        )
+    )
+
+
+def should_record_player_mistake(player_decision: BrainDecision, recommended: BrainDecision) -> bool:
+    if not recommended.trace:
+        return False
+    player_action = canonical_mistake_action(player_decision.action)
+    recommended_action = canonical_mistake_action(recommended.action)
+    if player_action != recommended_action:
+        return True
+    if player_action in {"bet_raise"}:
+        sizing_gap = abs(player_decision.target_total_bb - recommended.target_total_bb)
+        return sizing_gap >= max(2.0, recommended.target_total_bb * 0.35)
+    user_candidate = closest_candidate_for_action(
+        recommended.trace.candidates,
+        player_decision.action,
+        player_decision.target_total_bb,
+    )
+    recommended_candidate = chosen_candidate(recommended.trace.candidates)
+    if user_candidate and recommended_candidate:
+        return recommended_candidate.ev_bb - user_candidate.ev_bb >= 0.35
+    return False
+
+
+def canonical_mistake_action(action: BattleActionType) -> str:
+    if action in {"bet", "raise", "all_in"}:
+        return "bet_raise"
+    if action in {"check", "call"}:
+        return "continue"
+    return action
+
+
+def closest_candidate_for_action(
+    candidates: list[DecisionCandidate],
+    action: BattleActionType,
+    target_total_bb: float,
+) -> DecisionCandidate | None:
+    canonical = canonical_mistake_action(action)
+    matching = [
+        candidate
+        for candidate in candidates
+        if canonical_mistake_action(candidate.action) == canonical
+    ]
+    if not matching:
+        return None
+    return min(matching, key=lambda candidate: abs(candidate.target_total_bb - target_total_bb))
+
+
+def mistake_ev_delta(
+    player_decision: BrainDecision,
+    recommended: BrainDecision,
+    user_candidate: DecisionCandidate | None,
+    recommended_candidate: DecisionCandidate | None,
+) -> float:
+    if user_candidate and recommended_candidate:
+        return round_bb(max(recommended_candidate.ev_bb - user_candidate.ev_bb, 0.1))
+    if canonical_mistake_action(player_decision.action) != canonical_mistake_action(recommended.action):
+        return 0.6
+    return 0.1
 
 
 def start_next_hand(session_id: str, owner_id: str | None = None) -> BattleSession:

@@ -7,15 +7,19 @@ from fastapi.testclient import TestClient
 
 from app.battle import SESSIONS
 from app.main import app
+from app.mistakes import MISTAKES
 
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     monkeypatch.setenv("POKERCOACH_BATTLE_STORE_DIR", str(tmp_path / "battle-store"))
+    monkeypatch.setenv("POKERCOACH_MISTAKE_STORE_DIR", str(tmp_path / "mistake-store"))
     SESSIONS.clear()
+    MISTAKES.clear()
     with TestClient(app) as test_client:
         yield test_client
     SESSIONS.clear()
+    MISTAKES.clear()
 
 
 def auth_headers(client: TestClient) -> dict[str, str]:
@@ -356,6 +360,71 @@ def test_battle_route_errors_are_contractual(client: TestClient) -> None:
         json={"observer_seat": 2},
     )
     assert next_too_early.status_code == 409
+
+
+def test_player_wrong_action_is_recorded_as_reviewable_mistake(client: TestClient) -> None:
+    headers = auth_headers(client)
+    create_response = client.post(
+        "/battle/sessions",
+        headers=headers,
+        json={
+            "table_size": 2,
+            "observer_seat": 0,
+            "player_seat": 0,
+            "mode": "play",
+            "starting_stack_bb": 100,
+            "seed": "mistake-seed-3",
+        },
+    )
+    assert create_response.status_code == 201
+    snapshot = create_response.json()
+    session_id = snapshot["id"]
+    assert snapshot["active_seat"] == 0
+    assert snapshot["seats"][0]["is_human"] is True
+
+    action_response = client.post(
+        f"/battle/sessions/{session_id}/player-action",
+        headers=headers,
+        json={"observer_seat": 0, "action": "fold"},
+    )
+    assert action_response.status_code == 200
+
+    list_response = client.get("/training/mistakes", headers=headers)
+    assert list_response.status_code == 200
+    mistakes = list_response.json()
+    assert mistakes
+    mistake = mistakes[0]
+    assert mistake["id"].startswith("mis_")
+    assert mistake["position"] == "SB"
+    assert mistake["hero_cards"] == ["Jc", "Ts"]
+    assert mistake["user_action_label"] == "弃牌"
+    assert mistake["recommended_action_label"] in {"加注", "下注"}
+    assert mistake["ev_delta_bb"] > 0
+
+    detail_response = client.get(f"/training/mistakes/{mistake['id']}", headers=headers)
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["session_id"] == session_id
+    assert detail["scenario"]["session_id"] == session_id
+    assert detail["scenario"]["hand_number"] == 1
+    assert detail["scenario"]["hero_cards"] == ["Jc", "Ts"]
+    assert detail["scenario"]["table_seats"]
+    assert detail["candidates"]
+    assert any(candidate["is_recommended"] for candidate in detail["candidates"])
+    assert "EV" in detail["why_wrong"]
+    assert detail["correct_play"]
+    assert detail["coach_messages"][0]["role"] == "agent"
+
+    coach_response = client.post(
+        f"/training/mistakes/{mistake['id']}/coach",
+        headers=headers,
+        json={"message": "为什么不能弃牌？"},
+    )
+    assert coach_response.status_code == 200
+    coached = coach_response.json()
+    assert coached["coach_messages"][-2]["role"] == "user"
+    assert coached["coach_messages"][-1]["role"] == "agent"
+    assert "SPR" in coached["coach_messages"][-1]["content"]
 
 
 def test_battle_sessions_are_private_to_the_creating_user(client: TestClient) -> None:

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 
 from app.data import SCENARIOS
 from app.dependencies import require_current_user
+from app.mistakes import dashboard_mistake_texts
 from app.schemas import DailyPlan, DashboardResponse, ModuleCard, User
 
 
@@ -51,9 +52,6 @@ def dashboard(user: User = Depends(require_current_user)) -> DashboardResponse:
                 ),
             ],
         ),
-        recent_mistakes=[
-            "面对 UTG 强范围时，高张非同花牌容易被主导。",
-            "小盲位缺少位置优势，跟注范围需要更紧。",
-        ],
+        recent_mistakes=dashboard_mistake_texts(user.id),
         next_drill_id=SCENARIOS[0].id,
     )

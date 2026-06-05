@@ -4,6 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.data import HAND_QUIZZES, SCENARIOS
 from app.dependencies import require_current_user
+from app.mistakes import (
+    BattleMistakeDetail,
+    BattleMistakeSummary,
+    CoachMessageRequest,
+    add_coach_message,
+    get_mistake,
+    list_mistakes,
+)
 from app.schemas import AnswerRequest, DecisionResult, HandQuiz, PreflopScenario, User
 
 
@@ -38,6 +46,28 @@ def answer_preflop(
 @router.get("/hand-quiz", response_model=list[HandQuiz])
 def hand_quiz(_: User = Depends(require_current_user)) -> list[HandQuiz]:
     return HAND_QUIZZES
+
+
+@router.get("/mistakes", response_model=list[BattleMistakeSummary])
+def mistakes(user: User = Depends(require_current_user)) -> list[BattleMistakeSummary]:
+    return list_mistakes(user.id)
+
+
+@router.get("/mistakes/{mistake_id}", response_model=BattleMistakeDetail)
+def mistake_detail(
+    mistake_id: str,
+    user: User = Depends(require_current_user),
+) -> BattleMistakeDetail:
+    return get_mistake(mistake_id, user.id)
+
+
+@router.post("/mistakes/{mistake_id}/coach", response_model=BattleMistakeDetail)
+def coach_mistake(
+    mistake_id: str,
+    payload: CoachMessageRequest,
+    user: User = Depends(require_current_user),
+) -> BattleMistakeDetail:
+    return add_coach_message(mistake_id, user.id, payload)
 
 
 @router.post("/hand-quiz/{quiz_id}/answer", response_model=DecisionResult)
