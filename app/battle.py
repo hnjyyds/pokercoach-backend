@@ -1316,7 +1316,6 @@ def record_player_action_mistake(
     recommended_candidate = chosen_candidate(trace.candidates) or max(trace.candidates, key=lambda item: item.ev_bb, default=None)
     user_candidate = closest_candidate_for_action(trace.candidates, player_decision.action, player_decision.target_total_bb)
     ev_delta = mistake_ev_delta(player_decision, recommended, user_candidate, recommended_candidate)
-    hand_class = hand_notation(player.hole_cards)
     user_reason = f" {user_candidate.reason}" if user_candidate else ""
     recommended_sizing = (
         f"到 {round_bb(recommended.target_total_bb)}BB"
@@ -1329,7 +1328,7 @@ def record_player_action_mistake(
             owner_id=owner_id,
             session_id=session.id,
             hand_number=session.hand_number,
-            title=f"{player.position} {hand_class}：{action_label(player_decision.action)}偏离推荐",
+            title=f"{player.position} 决策偏差",
             subtitle=f"{street_label(session.street)} · 底池 {round_bb(session.pot_bb)}BB · 推荐{action_label(recommended.action)}",
             street=session.street,
             position=player.position,
@@ -1750,7 +1749,7 @@ def decide_action(session: BattleSession, player: PlayerState) -> BrainDecision:
         if open_spot:
             if range_profile.role == "混合开池" and mix <= range_profile.frequency * 0.35:
                 return decision("call", session.current_bet_bb, f"{range_profile.note} 低频跟入，保留底池参与权。")
-            return decision("fold", player.street_bet_bb, f"{hand_class} 不在 {player.position} 开池范围内，弃牌。")
+            return decision("fold", player.street_bet_bb, f"当前组合不在 {player.position} 开池范围内，弃牌。")
         return decision("check", player.street_bet_bb, "无须投入更多筹码，保留范围。")
 
     continue_threshold = max(pot_odds - 0.02, 0.08)
@@ -1799,7 +1798,7 @@ def decide_action(session: BattleSession, player: PlayerState) -> BrainDecision:
     if strength + pressure + discipline >= continue_threshold or range_continue:
         return decision("call", session.current_bet_bb, f"{range_profile.note} 赔率允许继续，跟注保留对手较宽范围。")
 
-    return decision("fold", player.street_bet_bb, f"{hand_class} 不在当前继续范围内，弃牌。")
+    return decision("fold", player.street_bet_bb, "当前组合不在继续范围内，弃牌。")
 
 
 def apply_decision(session: BattleSession, player: PlayerState, decision: BrainDecision) -> None:
@@ -2623,7 +2622,7 @@ def decision_tags(
     board_texture: str,
     spr: float,
 ) -> list[str]:
-    tags = [player.position, hand_class, range_bucket]
+    tags = [player.position, range_bucket]
     tags.append("GTO范围" if session.street == "preflop" else board_texture)
     if action in {"bet", "raise", "all_in"}:
         tags.append("弃牌权益")
@@ -3054,7 +3053,7 @@ def build_tasks(session: BattleSession, observer_seat: int) -> list[BattleTaskSn
             id="range",
             title="范围推演",
             subtitle=(
-                f"{observer_trace.hand_class} · {observer_trace.range_bucket}"
+                f"{observer.position} · {observer_trace.range_bucket}"
                 if observer_trace
                 else f"{observer.position} {observer.agent.name} · {street_label(session.street)}"
             ),

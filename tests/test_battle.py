@@ -269,7 +269,9 @@ class BattleEngineTests(unittest.TestCase):
         self.assertEqual(snapshot.replay_events[-1].kind, "action")
         self.assertEqual(snapshot.replay_events[-1].action_id, agent_action.id)
         self.assertIsNotNone(snapshot.replay_events[-1].decision)
-        self.assertIn(agent_action.decision.hand_class, snapshot.tasks[0].subtitle)
+        self.assertIn(session.players[active_before].position, snapshot.tasks[0].subtitle)
+        self.assertIn(agent_action.decision.range_bucket, snapshot.tasks[0].subtitle)
+        self.assertNotIn(agent_action.decision.hand_class, snapshot.tasks[0].subtitle)
 
     def test_preflop_range_profile_drives_position_and_3bet_roles(self) -> None:
         session = create_battle_session(BattleSessionCreate(table_size=6, observer_seat=0, seed="range-profile-seed"))

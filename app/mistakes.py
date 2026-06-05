@@ -229,7 +229,7 @@ def add_coach_message(mistake_id: str, owner_id: str, request: CoachMessageReque
 
 def dashboard_mistake_texts(owner_id: str) -> list[str]:
     return [
-        f"{mistake.position} {' '.join(mistake.hero_cards)}：{mistake.user_action_label}偏离推荐，建议{mistake.recommended_action_label}。"
+        f"{mistake.position} 决策偏差：{mistake.user_action_label}偏离推荐，建议{mistake.recommended_action_label}。"
         for mistake in list_mistakes(owner_id)[:2]
     ]
 
@@ -280,7 +280,7 @@ def load_mistake_from_path(path: Path) -> BattleMistakeDetail | None:
 
 def initial_coach_message(payload: BattleMistakeCreate) -> str:
     return (
-        f"这手 {payload.position} {' '.join(payload.hero_cards)} 的关键偏差是："
+        f"这手 {payload.position} 的关键偏差是："
         f"你选择了{payload.user_action_label}，系统推荐{payload.recommended_action_label}。"
         f"EV 差约 {payload.ev_delta_bb:.1f}BB。{payload.correct_play}"
     )
@@ -315,7 +315,7 @@ def seed_mistakes(owner_id: str) -> list[BattleMistakeDetail]:
             session_id="seed_session",
             hand_number=1,
             action_id=None,
-            title="KQo 面对 UTG 加注",
+            title="面对 UTG 加注",
             subtitle="CO · Preflop · 反向隐含赔率",
             street="preflop",
             position="CO",
@@ -346,14 +346,14 @@ def seed_mistakes(owner_id: str) -> list[BattleMistakeDetail]:
                     BattleMistakeTableSeat(seat_index=3, position="UTG", name="River", stack_bb=98, committed_bb=2.5, status="active"),
                     BattleMistakeTableSeat(seat_index=5, position="CO", name="Alex", stack_bb=100, committed_bb=0, status="active", is_hero=True),
                 ],
-                tags=["CO", "KQo", "被主导", "高SPR"],
+                tags=["CO", "被主导", "高SPR"],
             ),
             candidates=[
-                BattleMistakeCandidate(action="fold", label="弃牌", target_total_bb=0, ev_bb=0.2, weight=0.55, is_recommended=True, reason="UTG 范围强，KQo 容易被 AQ/AK/KQs 主导。"),
+                BattleMistakeCandidate(action="fold", label="弃牌", target_total_bb=0, ev_bb=0.2, weight=0.55, is_recommended=True, reason="UTG 范围强，这类高张非同花组合容易被顶张强范围和高对子主导。"),
                 BattleMistakeCandidate(action="call", label="跟注", target_total_bb=2.5, ev_bb=-0.9, weight=0.30, is_recommended=False, reason="高 SPR 下反向隐含赔率变大，翻后容易支付强牌。"),
                 BattleMistakeCandidate(action="raise", label="3-bet", target_total_bb=8, ev_bb=-0.3, weight=0.15, is_recommended=False, reason="阻断不足，面对 4-bet 难继续。"),
             ],
-            why_wrong="KQo 看起来像高张强牌，但面对 UTG 紧范围，经常被 AK、AQ、QQ+ 主导；深筹码时跟注会把自己带进难打的大底池。",
+            why_wrong="这类高张非同花组合看起来很顺眼，但面对 UTG 紧范围经常被顶张强范围和高对子主导；深筹码时跟注会把自己带进难打的大底池。",
             correct_play="新手阶段直接弃牌，保留筹码进入位置更好、范围更清晰的 spot。",
             icon="suit.club.fill",
             accent="#F59E0B",
@@ -362,7 +362,7 @@ def seed_mistakes(owner_id: str) -> list[BattleMistakeDetail]:
                 CoachMessageSnapshot(
                     id="seed_msg_utg_1",
                     role="agent",
-                    content="这手重点不是 KQ 漂亮，而是 UTG 范围太强。先把被主导风险排除，会少输很多大底池。",
+                    content="这手重点不是两张高张好看，而是 UTG 范围太强。先把被主导风险排除，会少输很多大底池。",
                     created_at="2026-06-05T00:00:00+00:00",
                 )
             ],
@@ -405,14 +405,14 @@ def seed_mistakes(owner_id: str) -> list[BattleMistakeDetail]:
                     BattleMistakeTableSeat(seat_index=1, position="SB", name="Alex", stack_bb=99.5, committed_bb=0.5, status="active", is_hero=True),
                     BattleMistakeTableSeat(seat_index=2, position="BB", name="Ivy", stack_bb=99, committed_bb=1, status="active"),
                 ],
-                tags=["SB", "Q8s", "位置劣势", "高SPR"],
+                tags=["SB", "位置劣势", "高SPR"],
             ),
             candidates=[
                 BattleMistakeCandidate(action="fold", label="弃牌", target_total_bb=0.5, ev_bb=0.1, weight=0.50, is_recommended=True, reason="小盲位翻后全程失位，边缘同花牌实现权益困难。"),
                 BattleMistakeCandidate(action="call", label="跟注", target_total_bb=2.5, ev_bb=-0.7, weight=0.34, is_recommended=False, reason="容易形成被动多人池，翻后难以控池。"),
                 BattleMistakeCandidate(action="raise", label="3-bet", target_total_bb=9, ev_bb=-0.2, weight=0.16, is_recommended=False, reason="阻断牌不足，面对继续范围权益不够。"),
             ],
-            why_wrong="小盲位没有位置，Q8s 的同花潜力不足以弥补翻后实现权益差；跟注还会给大盲好价格进入底池。",
+            why_wrong="小盲位没有位置，这类边缘同花牌的潜力不足以弥补翻后实现权益差；跟注还会给大盲好价格进入底池。",
             correct_play="直接弃牌或只在明确 exploit 对手过度开池时低频 3-bet，不要默认平跟。",
             icon="location.fill",
             accent="#EF4444",

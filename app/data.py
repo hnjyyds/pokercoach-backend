@@ -31,8 +31,8 @@ SCENARIOS: list[PreflopScenario] = [
         ],
         recommended_action="raise",
         recommended_sizing="2.5BB",
-        concept_tags=["位置优势", "偷盲", "同花A"],
-        explanation="按钮位面对无人入池时范围可以明显打开。A9s 有阻断强A、同花潜力和位置优势，标准策略是开放加注而不是 limp。",
+        concept_tags=["位置优势", "偷盲", "同花高牌"],
+        explanation="按钮位面对无人入池时范围可以明显打开。这类同花高牌有阻断顶张范围、同花潜力和位置优势，标准策略是开放加注而不是 limp。",
     ),
     PreflopScenario(
         id="pf_002",
@@ -50,7 +50,7 @@ SCENARIOS: list[PreflopScenario] = [
         recommended_action="fold",
         recommended_sizing="-",
         concept_tags=["反向隐含赔率", "位置", "范围压制"],
-        explanation="KQo 面对 UTG 强范围容易被 AK、AQ、QQ+ 压制。CO 位置还没有绝对优势，新手阶段建议先弃牌，减少被主导牌拖入大底池。",
+        explanation="这类高张非同花组合面对 UTG 强范围容易被顶张强范围和高对子压制。CO 位置还没有绝对优势，新手阶段建议先弃牌，减少被主导牌拖入大底池。",
     ),
     PreflopScenario(
         id="pf_003",
@@ -81,7 +81,7 @@ HAND_QUIZZES: list[HandQuiz] = [
         question="河牌摊牌谁赢？",
         options=["Hero", "Villain", "平局"],
         answer="Hero",
-        explanation="Hero 用 Ah Kh 和公共牌 Th Jh 3h 组成 A 高同花，击败 Villain 的一对 Q。",
+        explanation="Hero 用手牌和公共牌组成高张同花，击败 Villain 的一对高张。",
     ),
     HandQuiz(
         id="hq_002",
@@ -91,6 +91,6 @@ HAND_QUIZZES: list[HandQuiz] = [
         question="Hero 最终牌型是什么？",
         options=["三条", "葫芦", "两对"],
         answer="葫芦",
-        explanation="Hero 的 8c 8d 加公共牌 8h 形成三条 8，再配公共牌 2d 2s，最终是 8 满 2 的葫芦。",
+        explanation="Hero 的口袋对子命中三条，再配公共牌对子，最终是葫芦。",
     ),
 ]
