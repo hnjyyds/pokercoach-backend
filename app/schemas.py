@@ -115,6 +115,8 @@ class HandQuiz(BaseModel):
     difficulty: str = "新手"
     concept_tags: list[str] = Field(default_factory=list)
     coach_messages: list[QuizCoachMessageSnapshot] = Field(default_factory=list)
+    llm_source: str | None = None
+    is_llm_generated: bool = False
 
 
 class HandQuizGenerateRequest(BaseModel):

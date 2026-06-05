@@ -68,3 +68,29 @@ def test_agent_generated_hand_quiz_contract(client: TestClient) -> None:
     coached = coach_response.json()
     assert [message["role"] for message in coached["coach_messages"][-2:]] == ["user", "agent"]
     assert generated["thesis"].rstrip("。.!！?") in coached["coach_messages"][-1]["content"]
+
+
+def test_showdown_coach_answers_card_shape_before_strategy(client: TestClient) -> None:
+    headers = auth_headers(client)
+    generated_response = client.post(
+        "/training/hand-quiz/generate",
+        headers=headers,
+        json={"focus": "牌力识别", "difficulty": "新手", "street": "river"},
+    )
+    assert generated_response.status_code == 201
+    quiz = generated_response.json()
+
+    coach_response = client.post(
+        f"/training/hand-quiz/{quiz['id']}/coach",
+        headers=headers,
+        json={"message": "Why full house?"},
+    )
+
+    assert coach_response.status_code == 200
+    reply = coach_response.json()["coach_messages"][-1]["content"]
+    assert "最佳五张牌" in reply
+    assert "三张" in reply
+    assert "一对" in reply
+    assert "葫芦" in reply
+    assert "Hero 赢" in reply
+    assert "BB 位置" not in reply

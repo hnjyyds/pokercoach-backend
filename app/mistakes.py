@@ -8,7 +8,9 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from app.llm import LLMProviderError, get_llm_provider
 
 
 CoachRole = Literal["agent", "user"]
@@ -122,6 +124,19 @@ class CoachMessageRequest(BaseModel):
 
 
 MISTAKES: dict[str, BattleMistakeDetail] = {}
+
+MISTAKE_COACH_REPLY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["content"],
+    "properties": {
+        "content": {"type": "string", "minLength": 24, "maxLength": 420},
+    },
+}
+
+
+class MistakeCoachLLMReply(BaseModel):
+    content: str = Field(min_length=24, max_length=420)
 
 
 def now_iso() -> str:
@@ -279,6 +294,10 @@ def load_mistake_from_path(path: Path) -> BattleMistakeDetail | None:
 
 
 def initial_coach_message(payload: BattleMistakeCreate) -> str:
+    live_reply = generate_initial_mistake_reply(payload)
+    if live_reply:
+        return live_reply
+
     return (
         f"这手 {payload.position} 的关键偏差是："
         f"你选择了{payload.user_action_label}，系统推荐{payload.recommended_action_label}。"
@@ -287,6 +306,10 @@ def initial_coach_message(payload: BattleMistakeCreate) -> str:
 
 
 def coach_reply(detail: BattleMistakeDetail, user_message: str) -> str:
+    live_reply = generate_mistake_coach_reply(detail, user_message)
+    if live_reply:
+        return live_reply
+
     lowered = user_message.lower()
     scenario = detail.scenario
     core = (
@@ -304,6 +327,142 @@ def coach_reply(detail: BattleMistakeDetail, user_message: str) -> str:
         f"{core}你的动作是{detail.user_action_label}，推荐是{detail.recommended_action_label}。"
         f"主要原因：{detail.why_wrong}"
     )
+
+
+def generate_initial_mistake_reply(payload: BattleMistakeCreate) -> str | None:
+    provider = get_llm_provider()
+    if not provider.enabled:
+        return None
+
+    try:
+        result = provider.generate_json(
+            json.dumps(
+                {
+                    "task": "生成错题本第一条导师复盘消息",
+                    "locked_facts": mistake_create_context(payload),
+                    "algorithm_tools": mistake_tool_context(
+                        payload.scenario,
+                        payload.candidates,
+                        payload.user_action_label,
+                        payload.recommended_action_label,
+                        payload.ev_delta_bb,
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            schema_name="pokercoach_mistake_initial_reply",
+            schema=MISTAKE_COACH_REPLY_SCHEMA,
+            instructions=mistake_coach_instructions(),
+            max_output_tokens=380,
+        )
+        return MistakeCoachLLMReply.model_validate(result.data).content.strip()
+    except (LLMProviderError, ValidationError, ValueError):
+        return None
+
+
+def generate_mistake_coach_reply(detail: BattleMistakeDetail, user_message: str) -> str | None:
+    provider = get_llm_provider()
+    if not provider.enabled:
+        return None
+
+    try:
+        result = provider.generate_json(
+            json.dumps(
+                {
+                    "task": "回答用户围绕错题场景的追问",
+                    "user_message": user_message.strip(),
+                    "locked_facts": mistake_detail_context(detail),
+                    "algorithm_tools": mistake_tool_context(
+                        detail.scenario,
+                        detail.candidates,
+                        detail.user_action_label,
+                        detail.recommended_action_label,
+                        detail.ev_delta_bb,
+                    ),
+                    "conversation": [message.model_dump() for message in detail.coach_messages[-6:]],
+                },
+                ensure_ascii=False,
+            ),
+            schema_name="pokercoach_mistake_coach_reply",
+            schema=MISTAKE_COACH_REPLY_SCHEMA,
+            instructions=mistake_coach_instructions(),
+            max_output_tokens=420,
+        )
+        return MistakeCoachLLMReply.model_validate(result.data).content.strip()
+    except (LLMProviderError, ValidationError, ValueError):
+        return None
+
+
+def mistake_coach_instructions() -> str:
+    return (
+        "你是 PokerCoach 的 Agent 德扑导师。用户是新手，先用工具结果解释为什么错，再给一个可执行的修正。"
+        "不要改写 locked_facts 里的牌局事实、EV、推荐动作。回答 2-4 句，具体、克制。"
+        "不要输出 AKo、JTo、SB JTo 这类手牌简写；具体牌由 UI 图形展示。"
+    )
+
+
+def mistake_create_context(payload: BattleMistakeCreate) -> dict:
+    return {
+        "title": payload.title,
+        "subtitle": payload.subtitle,
+        "street": payload.street,
+        "position": payload.position,
+        "hero_cards": payload.hero_cards,
+        "board": payload.board,
+        "user_action_label": payload.user_action_label,
+        "recommended_action_label": payload.recommended_action_label,
+        "ev_delta_bb": payload.ev_delta_bb,
+        "why_wrong": payload.why_wrong,
+        "correct_play": payload.correct_play,
+    }
+
+
+def mistake_detail_context(detail: BattleMistakeDetail) -> dict:
+    return {
+        "title": detail.title,
+        "subtitle": detail.subtitle,
+        "street": detail.street,
+        "position": detail.position,
+        "hero_cards": detail.hero_cards,
+        "board": detail.board,
+        "user_action_label": detail.user_action_label,
+        "recommended_action_label": detail.recommended_action_label,
+        "ev_delta_bb": detail.ev_delta_bb,
+        "why_wrong": detail.why_wrong,
+        "correct_play": detail.correct_play,
+        "scenario": detail.scenario.model_dump(),
+    }
+
+
+def mistake_tool_context(
+    scenario: BattleMistakeScenario,
+    candidates: list[BattleMistakeCandidate],
+    user_action_label: str,
+    recommended_action_label: str,
+    ev_delta_bb: float,
+) -> list[dict]:
+    return [
+        {
+            "tool": "spot_snapshot",
+            "result": {
+                "position": scenario.position,
+                "street": scenario.street,
+                "pot_bb": scenario.pot_bb,
+                "stack_bb": scenario.stack_bb,
+                "spr": scenario.spr,
+                "tags": scenario.tags,
+            },
+        },
+        {
+            "tool": "ev_action_compare",
+            "result": {
+                "user_action": user_action_label,
+                "recommended_action": recommended_action_label,
+                "ev_delta_bb": round(ev_delta_bb, 2),
+                "candidates": [candidate.model_dump() for candidate in candidates],
+            },
+        },
+    ]
 
 
 def seed_mistakes(owner_id: str) -> list[BattleMistakeDetail]:

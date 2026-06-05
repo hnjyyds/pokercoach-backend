@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import HTTPException, status
+from pydantic import BaseModel, Field, ValidationError
 
 from app.data import HAND_QUIZZES
+from app.llm import LLMProviderError, get_llm_provider
+from app.poker_eval import describe_showdown
 from app.schemas import (
     DecisionResult,
     HandQuiz,
@@ -15,6 +19,38 @@ from app.schemas import (
 
 
 GENERATED_QUIZZES: dict[str, list[HandQuiz]] = {}
+
+QUIZ_COPY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["question", "thesis", "explanation", "coach_opening"],
+    "properties": {
+        "question": {"type": "string", "minLength": 8, "maxLength": 80},
+        "thesis": {"type": "string", "minLength": 8, "maxLength": 90},
+        "explanation": {"type": "string", "minLength": 24, "maxLength": 220},
+        "coach_opening": {"type": "string", "minLength": 16, "maxLength": 180},
+    },
+}
+
+COACH_REPLY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["content"],
+    "properties": {
+        "content": {"type": "string", "minLength": 24, "maxLength": 360},
+    },
+}
+
+
+class QuizLLMCopy(BaseModel):
+    question: str = Field(min_length=8, max_length=80)
+    thesis: str = Field(min_length=8, max_length=90)
+    explanation: str = Field(min_length=24, max_length=220)
+    coach_opening: str = Field(min_length=16, max_length=180)
+
+
+class CoachLLMReply(BaseModel):
+    content: str = Field(min_length=24, max_length=360)
 
 
 def now_iso() -> str:
@@ -34,33 +70,34 @@ def list_hand_quizzes(owner_id: str) -> list[HandQuiz]:
 
 def generate_hand_quiz(owner_id: str, request: HandQuizGenerateRequest) -> HandQuiz:
     template = choose_template(request)
+    llm_copy, llm_source = generate_quiz_copy(template, request)
+    copy_source = llm_copy.model_dump() if llm_copy else {}
     quiz = HandQuiz(
         id=f"hq_agent_{uuid4().hex[:10]}",
         hero_hand=template["hero_hand"],
         villain_hand=template["villain_hand"],
         board=template["board"],
-        question=template["question"],
+        question=copy_source.get("question", template["question"]),
         options=template["options"],
         answer=template["answer"],
-        explanation=template["explanation"],
+        explanation=copy_source.get("explanation", template["explanation"]),
         source_agent=template["agent"],
         agent_icon=template["agent_icon"],
         agent_accent=template["agent_accent"],
-        thesis=template["thesis"],
+        thesis=copy_source.get("thesis", template["thesis"]),
         street=request.street,
         position=template["position"],
         stack_depth_bb=template["stack_depth_bb"],
         pot_bb=template["pot_bb"],
         difficulty=request.difficulty,
         concept_tags=template["concept_tags"],
+        llm_source=llm_source,
+        is_llm_generated=llm_source is not None,
         coach_messages=[
             QuizCoachMessageSnapshot(
                 id=f"msg_{uuid4().hex[:10]}",
                 role="agent",
-                content=(
-                    f"这题的论点是：{clean_sentence(template['thesis'])}。先只看牌面图形、位置和底池，"
-                    "不要急着背答案。"
-                ),
+                content=copy_source.get("coach_opening", fallback_quiz_opening(template)),
                 created_at=now_iso(),
             )
         ],
@@ -151,6 +188,104 @@ def quiz_with_agent_context(quiz: HandQuiz) -> HandQuiz:
     )
 
 
+def fallback_quiz_opening(template: dict) -> str:
+    return (
+        f"这题的论点是：{clean_sentence(template['thesis'])}。先只看牌面图形、位置和底池，"
+        "不要急着背答案。"
+    )
+
+
+def generate_quiz_copy(
+    template: dict,
+    request: HandQuizGenerateRequest,
+) -> tuple[QuizLLMCopy | None, str | None]:
+    provider = get_llm_provider()
+    if not provider.enabled:
+        return None, None
+
+    try:
+        result = provider.generate_json(
+            json.dumps(
+                {
+                    "user_request": request.model_dump(),
+                    "locked_facts": locked_quiz_facts(template),
+                    "algorithm_tools": quiz_tool_context(template),
+                    "style": {
+                        "language": "简体中文",
+                        "audience": "中文德州扑克新手",
+                        "tone": "短、清楚、像导师，不炫技",
+                        "no_raw_card_shortcuts": True,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            schema_name="pokercoach_quiz_copy",
+            schema=QUIZ_COPY_SCHEMA,
+            instructions=(
+                "你是 PokerCoach 的德州扑克导师 Agent。你会读取后端工具给出的牌面事实、位置、底池、后手和推荐答案，"
+                "只负责把题目表达得更像真人导师。禁止改变 locked_facts 里的答案、选项、牌面、位置和数值。"
+                "不要输出 AKo、JTo、SB JTo 这类手牌简写；具体牌会由 UI 用图形展示。"
+            ),
+            max_output_tokens=420,
+        )
+        return QuizLLMCopy.model_validate(result.data), provider.config.model
+    except (LLMProviderError, ValidationError, ValueError):
+        return None, None
+
+
+def locked_quiz_facts(template: dict) -> dict:
+    return {
+        "hero_hand": template["hero_hand"],
+        "villain_hand": template["villain_hand"],
+        "board": template["board"],
+        "options": template["options"],
+        "answer": template["answer"],
+        "position": template["position"],
+        "stack_depth_bb": template["stack_depth_bb"],
+        "pot_bb": template["pot_bb"],
+        "concept_tags": template["concept_tags"],
+        "baseline_question": template["question"],
+        "baseline_explanation": template["explanation"],
+        "baseline_thesis": template["thesis"],
+    }
+
+
+def quiz_tool_context(template: dict) -> list[dict]:
+    return [
+        {
+            "tool": "position_and_stack_classifier",
+            "result": {
+                "position": template["position"],
+                "effective_stack_bb": template["stack_depth_bb"],
+                "stack_bucket": stack_bucket(template["stack_depth_bb"]),
+            },
+        },
+        {
+            "tool": "pot_context",
+            "result": {
+                "pot_bb": template["pot_bb"],
+                "beginner_focus": template["thesis"],
+            },
+        },
+        {
+            "tool": "decision_validator",
+            "result": {
+                "allowed_options": template["options"],
+                "recommended_answer": template["answer"],
+                "reason": template["explanation"],
+            },
+        },
+    ]
+
+
+def stack_bucket(stack_depth_bb: int) -> str:
+    if stack_depth_bb <= 40:
+        return "短后手"
+    if stack_depth_bb >= 140:
+        return "深后手"
+    return "标准后手"
+
+
 def choose_template(request: HandQuizGenerateRequest) -> dict:
     normalized_focus = request.focus.lower()
     if "赔率" in request.focus or "outs" in normalized_focus:
@@ -210,7 +345,15 @@ def choose_template(request: HandQuizGenerateRequest) -> dict:
 
 def coach_reply(quiz: HandQuiz, message: str) -> str:
     lowered = message.lower()
+    tool_context = quiz_coach_tool_context(quiz, lowered)
+    live_reply = generate_coach_reply(quiz, message, tool_context)
+    if live_reply:
+        return live_reply
+
     thesis = clean_sentence(quiz.thesis)
+    showdown_reply = fallback_showdown_reply(tool_context)
+    if showdown_reply:
+        return showdown_reply
     if "为什么" in message or "why" in lowered:
         return (
             f"因为这题的核心论点是“{thesis}”。你要先用牌面图形确认最佳五张，"
@@ -224,4 +367,114 @@ def coach_reply(quiz: HandQuiz, message: str) -> str:
     return (
         f"围绕当前题目，我会先抓三个点：{', '.join(quiz.concept_tags[:3])}。"
         f"本题推荐答案是“{quiz.answer}”，但真正要记住的是：{thesis}。"
+    )
+
+
+def generate_coach_reply(quiz: HandQuiz, message: str, tool_context: list[dict]) -> str | None:
+    provider = get_llm_provider()
+    if not provider.enabled:
+        return None
+
+    try:
+        result = provider.generate_json(
+            json.dumps(
+                {
+                    "user_message": message.strip(),
+                    "locked_facts": {
+                        "question": quiz.question,
+                        "options": quiz.options,
+                        "answer": quiz.answer,
+                        "explanation": quiz.explanation,
+                        "thesis": quiz.thesis,
+                        "position": quiz.position,
+                        "street": quiz.street,
+                        "stack_depth_bb": quiz.stack_depth_bb,
+                        "pot_bb": quiz.pot_bb,
+                        "concept_tags": quiz.concept_tags,
+                    },
+                    "algorithm_tools": tool_context,
+                    "conversation": [message.model_dump() for message in quiz.coach_messages[-6:]],
+                },
+                ensure_ascii=False,
+            ),
+            schema_name="pokercoach_quiz_coach_reply",
+            schema=COACH_REPLY_SCHEMA,
+            instructions=(
+                "你是 PokerCoach 的德州扑克专家导师 Agent，擅长 GTO 基础、现场局 exploit、牌型判定和新手教学。"
+                "你的工作方式必须是：先理解用户问题，再选择 algorithm_tools 中最相关的工具结果组织回答。"
+                "不能改变 locked_facts 或工具结果里的牌局事实、推荐答案、牌型、胜负和数值。"
+                "如果用户问牌型、摊牌、为什么是某个牌型，必须优先使用 showdown_evaluator 工具结果，"
+                "说明最佳五张牌如何组成；不要转去讲位置、后手、底池。"
+                "如果用户问策略、EV、深短后手，再使用 answer_validator、stack_context 等工具结果。"
+                "回答控制在 2-4 句，中文为主，即使用户用英文提问也可以中文回答。"
+                "不要输出 AKo、JTo、SB JTo 等手牌简写；具体牌由 UI 图形展示。"
+            ),
+            max_output_tokens=360,
+        )
+        reply = CoachLLMReply.model_validate(result.data)
+        return reply.content.strip()
+    except (LLMProviderError, ValidationError, ValueError):
+        return None
+
+
+def quiz_coach_tool_context(quiz: HandQuiz, lowered_message: str) -> list[dict]:
+    tools = [
+        {
+            "tool": "answer_validator",
+            "result": {
+                "correct_answer": quiz.answer,
+                "locked_explanation": quiz.explanation,
+            },
+        },
+        {
+            "tool": "stack_context",
+            "result": {
+                "bucket": stack_bucket(quiz.stack_depth_bb),
+                "effective_stack_bb": quiz.stack_depth_bb,
+                "position": quiz.position,
+                "pot_bb": quiz.pot_bb,
+            },
+        },
+    ]
+    if asks_for_showdown_shape(lowered_message) or "牌型识别" in quiz.concept_tags or "摊牌判断" in quiz.concept_tags:
+        showdown = describe_showdown(quiz.hero_hand, quiz.villain_hand, quiz.board)
+        if showdown:
+            tools.insert(
+                0,
+                {
+                    "tool": "showdown_evaluator",
+                    "result": {
+                        "hero": {
+                            "made_hand": showdown.hero.label,
+                            "detail": showdown.hero.detail,
+                            "best_cards": list(showdown.hero.best_cards),
+                        },
+                        "villain": {
+                            "made_hand": showdown.villain.label,
+                            "detail": showdown.villain.detail,
+                            "best_cards": list(showdown.villain.best_cards),
+                        }
+                        if showdown.villain
+                        else None,
+                        "winner": showdown.winner,
+                        "teaching_summary": showdown.content,
+                    },
+                },
+            )
+    return tools
+
+
+def fallback_showdown_reply(tool_context: list[dict]) -> str | None:
+    showdown_tool = next((item for item in tool_context if item["tool"] == "showdown_evaluator"), None)
+    if not showdown_tool:
+        return None
+    result = showdown_tool["result"]
+    summary = result.get("teaching_summary") if isinstance(result, dict) else None
+    return summary if isinstance(summary, str) and summary else None
+
+
+def asks_for_showdown_shape(lowered_message: str) -> bool:
+    return any(
+        token in lowered_message
+        for token in ["葫芦", "牌型", "摊牌", "full house", "why full", "showdown", "hand rank"]
     )
