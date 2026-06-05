@@ -88,6 +88,13 @@ class DecisionResult(BaseModel):
     next_prompt: str
 
 
+class QuizCoachMessageSnapshot(BaseModel):
+    id: str
+    role: Literal["agent", "user"]
+    content: str
+    created_at: str
+
+
 class HandQuiz(BaseModel):
     id: str
     hero_hand: str
@@ -97,6 +104,23 @@ class HandQuiz(BaseModel):
     options: list[str]
     answer: str
     explanation: str
+    source_agent: str = "Ivy"
+    agent_icon: str = "sparkles"
+    agent_accent: str = "#8B5CF6"
+    thesis: str = "先识别牌型，再判断摊牌结果。"
+    street: str = "river"
+    position: str = "BTN"
+    stack_depth_bb: int = 100
+    pot_bb: float = 8.5
+    difficulty: str = "新手"
+    concept_tags: list[str] = Field(default_factory=list)
+    coach_messages: list[QuizCoachMessageSnapshot] = Field(default_factory=list)
+
+
+class HandQuizGenerateRequest(BaseModel):
+    focus: str = Field(default="牌力识别", min_length=2, max_length=40)
+    difficulty: str = Field(default="新手", min_length=2, max_length=20)
+    street: str = Field(default="river", min_length=3, max_length=20)
 
 
 class OddsRequest(BaseModel):
