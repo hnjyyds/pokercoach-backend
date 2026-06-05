@@ -10,6 +10,17 @@ from uuid import uuid4
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field, ValidationError
 
+from app.agent_tools import (
+    AgentToolResult,
+    AgentToolSelection,
+    MISTAKE_COACH_TOOL_CATALOG,
+    TOOL_SELECTION_SCHEMA,
+    ev_action_compare_tool,
+    normalize_selected_tool_names,
+    serialize_tool_catalog,
+    serialize_tools,
+    spot_snapshot_tool,
+)
 from app.llm import LLMProviderError, get_llm_provider
 
 
@@ -346,6 +357,11 @@ def generate_initial_mistake_reply(payload: BattleMistakeCreate) -> str | None:
                         payload.user_action_label,
                         payload.recommended_action_label,
                         payload.ev_delta_bb,
+                        selected_tool_names=select_mistake_tool_names(
+                            "生成错题本第一条导师复盘消息",
+                            mistake_create_context(payload),
+                            fallback=["spot_snapshot", "ev_action_compare"],
+                        ),
                     ),
                 },
                 ensure_ascii=False,
@@ -378,6 +394,11 @@ def generate_mistake_coach_reply(detail: BattleMistakeDetail, user_message: str)
                         detail.user_action_label,
                         detail.recommended_action_label,
                         detail.ev_delta_bb,
+                        selected_tool_names=select_mistake_tool_names(
+                            user_message,
+                            mistake_detail_context(detail),
+                            fallback=fallback_mistake_tool_names(user_message.lower()),
+                        ),
                     ),
                     "conversation": [message.model_dump() for message in detail.coach_messages[-6:]],
                 },
@@ -395,8 +416,9 @@ def generate_mistake_coach_reply(detail: BattleMistakeDetail, user_message: str)
 
 def mistake_coach_instructions() -> str:
     return (
-        "你是 PokerCoach 的 Agent 德扑导师。用户是新手，先用工具结果解释为什么错，再给一个可执行的修正。"
-        "不要改写 locked_facts 里的牌局事实、EV、推荐动作。回答 2-4 句，具体、克制。"
+        "你是 PokerCoach 的 Agent 德扑导师。用户是新手。你会收到调度阶段选择并执行后的工具结果，"
+        "根据用户问题选择性引用，不要堆砌数据。不要改写 locked_facts 里的牌局事实、EV、推荐动作。"
+        "回答 2-4 句，具体、克制。"
         "不要输出 AKo、JTo、SB JTo 这类手牌简写；具体牌由 UI 图形展示。"
     )
 
@@ -440,29 +462,63 @@ def mistake_tool_context(
     user_action_label: str,
     recommended_action_label: str,
     ev_delta_bb: float,
+    selected_tool_names: list[str] | None = None,
 ) -> list[dict]:
-    return [
-        {
-            "tool": "spot_snapshot",
-            "result": {
-                "position": scenario.position,
-                "street": scenario.street,
-                "pot_bb": scenario.pot_bb,
-                "stack_bb": scenario.stack_bb,
-                "spr": scenario.spr,
-                "tags": scenario.tags,
-            },
-        },
-        {
-            "tool": "ev_action_compare",
-            "result": {
-                "user_action": user_action_label,
-                "recommended_action": recommended_action_label,
-                "ev_delta_bb": round(ev_delta_bb, 2),
-                "candidates": [candidate.model_dump() for candidate in candidates],
-            },
-        },
-    ]
+    if selected_tool_names is None:
+        selected_tool_names = ["spot_snapshot", "ev_action_compare"]
+    tools: list[AgentToolResult] = []
+    for tool_name in selected_tool_names:
+        if tool_name == "spot_snapshot":
+            tools.append(spot_snapshot_tool(scenario))
+        elif tool_name == "ev_action_compare":
+            tools.append(
+                ev_action_compare_tool(
+                    candidates=candidates,
+                    user_action_label=user_action_label,
+                    recommended_action_label=recommended_action_label,
+                    ev_delta_bb=ev_delta_bb,
+                )
+            )
+    return serialize_tools(tools)
+
+
+def select_mistake_tool_names(task: str, locked_facts: dict, fallback: list[str]) -> list[str]:
+    provider = get_llm_provider()
+    if not provider.enabled:
+        return fallback
+
+    try:
+        result = provider.generate_json(
+            json.dumps(
+                {
+                    "task": task,
+                    "locked_facts": locked_facts,
+                    "available_tools": serialize_tool_catalog(MISTAKE_COACH_TOOL_CATALOG),
+                },
+                ensure_ascii=False,
+            ),
+            schema_name="pokercoach_mistake_tool_selection",
+            schema=TOOL_SELECTION_SCHEMA,
+            instructions=(
+                "你是 PokerCoach 的工具调度 Agent。根据用户问题或任务，从 available_tools 中选择需要调用的工具。"
+                "只返回工具名，不回答用户。可以选择 0 个或多个工具；只选对当前问题有帮助的工具。"
+                "不要固定套路，也不要为了使用工具而使用工具。"
+            ),
+            max_output_tokens=180,
+        )
+        selection = AgentToolSelection.model_validate(result.data)
+        return normalize_selected_tool_names(selection.selected_tools, MISTAKE_COACH_TOOL_CATALOG, fallback)
+    except (LLMProviderError, ValidationError, ValueError):
+        return fallback
+
+
+def fallback_mistake_tool_names(lowered_message: str) -> list[str]:
+    names: list[str] = []
+    if any(token in lowered_message for token in ["场景", "位置", "spr", "底池", "后手", "当时"]):
+        names.append("spot_snapshot")
+    if any(token in lowered_message for token in ["为什么", "why", "ev", "错", "应该", "推荐", "动作"]):
+        names.append("ev_action_compare")
+    return names or ["spot_snapshot", "ev_action_compare"]
 
 
 def seed_mistakes(owner_id: str) -> list[BattleMistakeDetail]:

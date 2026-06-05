@@ -30,8 +30,9 @@ OPENAI_MODEL=gpt-5.4-mini
 
 Agent boundaries:
 
-- The LLM understands the user question and writes concise coaching text.
+- The Agent understands the user question, chooses which backend tools to call, then writes concise coaching text from the returned tool results.
 - Backend tools provide poker facts: showdown hand class, winner, stack bucket, pot context, EV candidates, mistake reason, and recommended action.
+- Current tool catalog includes `showdown_evaluator`, `answer_validator`, `stack_context`, `position_and_stack_classifier`, `pot_context`, `decision_validator`, `spot_snapshot`, and `ev_action_compare`.
 - The LLM must not change tool facts, answers, hand classes, winners, EV values, or recommendations.
 - If the provider is not configured or fails, the API falls back to deterministic coaching.
 

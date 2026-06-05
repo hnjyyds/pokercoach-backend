@@ -7,9 +7,26 @@ from uuid import uuid4
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field, ValidationError
 
+from app.agent_tools import (
+    AgentToolResult,
+    AgentToolSelection,
+    QUIZ_COACH_TOOL_CATALOG,
+    QUIZ_GENERATION_TOOL_CATALOG,
+    TOOL_SELECTION_SCHEMA,
+    answer_validator_tool,
+    decision_validator_tool,
+    find_tool,
+    normalize_selected_tool_names,
+    position_and_stack_classifier_tool,
+    pot_context_tool,
+    serialize_tool_catalog,
+    serialize_tools,
+    showdown_evaluator_tool,
+    stack_bucket,
+    stack_context_tool,
+)
 from app.data import HAND_QUIZZES
 from app.llm import LLMProviderError, get_llm_provider
-from app.poker_eval import describe_showdown
 from app.schemas import (
     DecisionResult,
     HandQuiz,
@@ -209,6 +226,7 @@ def generate_quiz_copy(
                 {
                     "user_request": request.model_dump(),
                     "locked_facts": locked_quiz_facts(template),
+                    "available_tools": serialize_tool_catalog(QUIZ_GENERATION_TOOL_CATALOG),
                     "algorithm_tools": quiz_tool_context(template),
                     "style": {
                         "language": "简体中文",
@@ -251,39 +269,24 @@ def locked_quiz_facts(template: dict) -> dict:
 
 
 def quiz_tool_context(template: dict) -> list[dict]:
-    return [
-        {
-            "tool": "position_and_stack_classifier",
-            "result": {
-                "position": template["position"],
-                "effective_stack_bb": template["stack_depth_bb"],
-                "stack_bucket": stack_bucket(template["stack_depth_bb"]),
-            },
-        },
-        {
-            "tool": "pot_context",
-            "result": {
-                "pot_bb": template["pot_bb"],
-                "beginner_focus": template["thesis"],
-            },
-        },
-        {
-            "tool": "decision_validator",
-            "result": {
-                "allowed_options": template["options"],
-                "recommended_answer": template["answer"],
-                "reason": template["explanation"],
-            },
-        },
-    ]
-
-
-def stack_bucket(stack_depth_bb: int) -> str:
-    if stack_depth_bb <= 40:
-        return "短后手"
-    if stack_depth_bb >= 140:
-        return "深后手"
-    return "标准后手"
+    return serialize_tools(
+        [
+            position_and_stack_classifier_tool(
+                position=template["position"],
+                effective_stack_bb=template["stack_depth_bb"],
+                pot_bb=template["pot_bb"],
+            ),
+            pot_context_tool(
+                pot_bb=template["pot_bb"],
+                beginner_focus=template["thesis"],
+            ),
+            decision_validator_tool(
+                allowed_options=template["options"],
+                recommended_answer=template["answer"],
+                reason=template["explanation"],
+            ),
+        ]
+    )
 
 
 def choose_template(request: HandQuizGenerateRequest) -> dict:
@@ -345,7 +348,7 @@ def choose_template(request: HandQuizGenerateRequest) -> dict:
 
 def coach_reply(quiz: HandQuiz, message: str) -> str:
     lowered = message.lower()
-    tool_context = quiz_coach_tool_context(quiz, lowered)
+    tool_context = quiz_coach_tool_context(quiz, message)
     live_reply = generate_coach_reply(quiz, message, tool_context)
     if live_reply:
         return live_reply
@@ -401,11 +404,10 @@ def generate_coach_reply(quiz: HandQuiz, message: str, tool_context: list[dict])
             schema=COACH_REPLY_SCHEMA,
             instructions=(
                 "你是 PokerCoach 的德州扑克专家导师 Agent，擅长 GTO 基础、现场局 exploit、牌型判定和新手教学。"
-                "你的工作方式必须是：先理解用户问题，再选择 algorithm_tools 中最相关的工具结果组织回答。"
+                "你会收到上一步 Agent 调度阶段选择并执行后的 algorithm_tools。"
+                "根据用户问题选择性引用工具结果，不要为了展示工具而堆信息。"
                 "不能改变 locked_facts 或工具结果里的牌局事实、推荐答案、牌型、胜负和数值。"
-                "如果用户问牌型、摊牌、为什么是某个牌型，必须优先使用 showdown_evaluator 工具结果，"
-                "说明最佳五张牌如何组成；不要转去讲位置、后手、底池。"
-                "如果用户问策略、EV、深短后手，再使用 answer_validator、stack_context 等工具结果。"
+                "如果工具结果不足以回答，就说明还需要哪些牌局信息，不要编造。"
                 "回答控制在 2-4 句，中文为主，即使用户用英文提问也可以中文回答。"
                 "不要输出 AKo、JTo、SB JTo 等手牌简写；具体牌由 UI 图形展示。"
             ),
@@ -417,55 +419,77 @@ def generate_coach_reply(quiz: HandQuiz, message: str, tool_context: list[dict])
         return None
 
 
-def quiz_coach_tool_context(quiz: HandQuiz, lowered_message: str) -> list[dict]:
-    tools = [
-        {
-            "tool": "answer_validator",
-            "result": {
-                "correct_answer": quiz.answer,
-                "locked_explanation": quiz.explanation,
-            },
-        },
-        {
-            "tool": "stack_context",
-            "result": {
-                "bucket": stack_bucket(quiz.stack_depth_bb),
-                "effective_stack_bb": quiz.stack_depth_bb,
-                "position": quiz.position,
-                "pot_bb": quiz.pot_bb,
-            },
-        },
-    ]
-    if asks_for_showdown_shape(lowered_message) or "牌型识别" in quiz.concept_tags or "摊牌判断" in quiz.concept_tags:
-        showdown = describe_showdown(quiz.hero_hand, quiz.villain_hand, quiz.board)
-        if showdown:
-            tools.insert(
-                0,
+def quiz_coach_tool_context(quiz: HandQuiz, message: str) -> list[dict]:
+    selected_tool_names = select_quiz_coach_tool_names(quiz, message)
+    tools: list[AgentToolResult] = []
+    for tool_name in selected_tool_names:
+        if tool_name == "showdown_evaluator":
+            showdown_tool = showdown_evaluator_tool(quiz.hero_hand, quiz.villain_hand, quiz.board)
+            if showdown_tool:
+                tools.append(showdown_tool)
+        elif tool_name == "answer_validator":
+            tools.append(answer_validator_tool(quiz.answer, quiz.explanation))
+        elif tool_name == "stack_context":
+            tools.append(stack_context_tool(quiz.position, quiz.stack_depth_bb, quiz.pot_bb))
+    return serialize_tools(tools)
+
+
+def select_quiz_coach_tool_names(quiz: HandQuiz, message: str) -> list[str]:
+    fallback = fallback_quiz_coach_tool_names(quiz, message.lower())
+    provider = get_llm_provider()
+    if not provider.enabled:
+        return fallback
+
+    try:
+        result = provider.generate_json(
+            json.dumps(
                 {
-                    "tool": "showdown_evaluator",
-                    "result": {
-                        "hero": {
-                            "made_hand": showdown.hero.label,
-                            "detail": showdown.hero.detail,
-                            "best_cards": list(showdown.hero.best_cards),
-                        },
-                        "villain": {
-                            "made_hand": showdown.villain.label,
-                            "detail": showdown.villain.detail,
-                            "best_cards": list(showdown.villain.best_cards),
-                        }
-                        if showdown.villain
-                        else None,
-                        "winner": showdown.winner,
-                        "teaching_summary": showdown.content,
+                    "task": "为题目导师追问选择需要调用的后端算法工具",
+                    "user_message": message.strip(),
+                    "locked_facts": {
+                        "question": quiz.question,
+                        "answer": quiz.answer,
+                        "thesis": quiz.thesis,
+                        "street": quiz.street,
+                        "position": quiz.position,
+                        "stack_depth_bb": quiz.stack_depth_bb,
+                        "pot_bb": quiz.pot_bb,
+                        "concept_tags": quiz.concept_tags,
                     },
+                    "available_tools": serialize_tool_catalog(QUIZ_COACH_TOOL_CATALOG),
                 },
-            )
-    return tools
+                ensure_ascii=False,
+            ),
+            schema_name="pokercoach_quiz_tool_selection",
+            schema=TOOL_SELECTION_SCHEMA,
+            instructions=(
+                "你是 PokerCoach 的工具调度 Agent。根据用户问题和 available_tools 选择需要调用的工具。"
+                "只返回工具名，不回答用户。可以选择 0 个或多个工具；只选对当前问题有帮助的工具。"
+                "不要固定套路，也不要为了使用工具而使用工具。"
+            ),
+            max_output_tokens=180,
+        )
+        selection = AgentToolSelection.model_validate(result.data)
+        return normalize_selected_tool_names(selection.selected_tools, QUIZ_COACH_TOOL_CATALOG, fallback)
+    except (LLMProviderError, ValidationError, ValueError):
+        return fallback
+
+
+def fallback_quiz_coach_tool_names(quiz: HandQuiz, lowered_message: str) -> list[str]:
+    names: list[str] = []
+    if asks_for_showdown_shape(lowered_message) or "牌型识别" in quiz.concept_tags or "摊牌判断" in quiz.concept_tags:
+        names.append("showdown_evaluator")
+    if any(token in lowered_message for token in ["为什么", "why", "答案", "answer", "推荐"]):
+        names.append("answer_validator")
+    if any(token in lowered_message for token in ["如果", "深", "短", "short", "deep", "后手", "stack"]):
+        names.append("stack_context")
+    if not names:
+        names.append("answer_validator")
+    return names
 
 
 def fallback_showdown_reply(tool_context: list[dict]) -> str | None:
-    showdown_tool = next((item for item in tool_context if item["tool"] == "showdown_evaluator"), None)
+    showdown_tool = find_tool(tool_context, "showdown_evaluator")
     if not showdown_tool:
         return None
     result = showdown_tool["result"]
